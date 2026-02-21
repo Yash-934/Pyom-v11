@@ -110,7 +110,6 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
           ]),
         ),
       ]),
-      floatingActionButton: null,
     );
   }
 
@@ -209,7 +208,6 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
         if (_showTerminal) _buildResizablePanel(isOutput: false),
         _buildStatusBar(context),
       ]),
-      floatingActionButton: null,
     );
   }
 

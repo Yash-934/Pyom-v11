@@ -2,6 +2,9 @@
 package com.pyom
 
 import android.content.ContentValues
+import android.content.Context
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.Environment
 import android.os.Handler
@@ -12,14 +15,15 @@ import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
 import org.apache.commons.compress.compressors.gzip.GzipCompressorInputStream
 import java.io.BufferedInputStream
 import java.io.File
 import java.io.FileOutputStream
-import java.net.HttpURLConnection
-import java.net.URL
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.zip.ZipFile
 
@@ -27,12 +31,31 @@ class MainActivity : FlutterActivity() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private var currentProcess: Process? = null
     private val isSetupCancelled = AtomicBoolean(false)
+
+    // ── OkHttpClient — reliable DNS, redirects, retries ───────────────────
+    private val okHttpClient: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(30, TimeUnit.SECONDS)
+            .readTimeout(120, TimeUnit.SECONDS)
+            .writeTimeout(30, TimeUnit.SECONDS)
+            .followRedirects(true)
+            .followSslRedirects(true)
+            .retryOnConnectionFailure(true)
+            .build()
+    }
     private val executor = Executors.newCachedThreadPool()
 
     // ── Storage paths ──────────────────────────────────────────────────────
     private val extDir get() = getExternalFilesDir(null) ?: filesDir
     private val envRoot get() = File(extDir, "linux_env")
-    private val binDir get() = File(filesDir, "bin")
+
+    // ⚠️ CRITICAL EXEC PATH STRATEGY:
+    // Android has MS_NOEXEC on /data AND FUSE noexec on /sdcard on many devices.
+    // The ONLY guaranteed exec-safe locations are:
+    //   1. nativeLibraryDir  — set by Android package manager (ideal, needs libproot.so in jniLibs)
+    //   2. codeCacheDir      — /data/user/0/pkg/code_cache/ — Android marks this exec-safe for JIT
+    // We try both, codeCacheDir is our reliable fallback.
+    private val binDir get() = File(codeCacheDir, "bin")
     private val prootVersionFile get() = File(binDir, "proot.version")
     private val envConfigFile get() = File(filesDir, "env_config.json")
 
@@ -42,14 +65,39 @@ class MainActivity : FlutterActivity() {
 
     private val prootBin: File
         get() {
-            // Prefer the manually extracted binary if it exists and is executable
-            return if (prootExtractedBin.exists() && prootExtractedBin.canExecute()) prootExtractedBin
-            else prootBundledBin
+            // Check alt-path saved during setup (Priority 4 fallback)
+            val versionTxt = prootVersionFile.takeIf { it.exists() }?.readText()?.trim() ?: ""
+            if (versionTxt.startsWith("alt-path:")) {
+                val altFile = File(versionTxt.removePrefix("alt-path:"))
+                if (altFile.exists()) return altFile
+            }
+            // Prefer nativeLibraryDir (always exec-safe, no extraction needed)
+            if (prootBundledBin.exists()) return prootBundledBin
+            // Fall back to extracted binary in codeCacheDir
+            return prootExtractedBin
         }
 
     private val rootfsSources = mapOf(
-        "alpine" to listOf("https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/aarch64/alpine-minirootfs-3.19.1-aarch64.tar.gz"),
-        "ubuntu" to listOf("https://cdimage.ubuntu.com/ubuntu-base/releases/22.04/release/ubuntu-base-22.04.3-base-arm64.tar.gz"),
+        "alpine" to listOf(
+            // Mirror 1: Official Alpine CDN
+            "https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/aarch64/alpine-minirootfs-3.19.1-aarch64.tar.gz",
+            // Mirror 2: Tsinghua (China/Asia fast)
+            "https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.19/releases/aarch64/alpine-minirootfs-3.19.1-aarch64.tar.gz",
+            // Mirror 3: USTC China
+            "https://mirrors.ustc.edu.cn/alpine/v3.19/releases/aarch64/alpine-minirootfs-3.19.1-aarch64.tar.gz",
+            // Mirror 4: NJU China
+            "https://mirror.nju.edu.cn/alpine/v3.19/releases/aarch64/alpine-minirootfs-3.19.1-aarch64.tar.gz",
+        ),
+        "ubuntu" to listOf(
+            // Mirror 1: Official Ubuntu CDImage
+            "https://cdimage.ubuntu.com/ubuntu-base/releases/22.04/release/ubuntu-base-22.04.3-base-arm64.tar.gz",
+            // Mirror 2: Tsinghua mirror
+            "https://mirrors.tuna.tsinghua.edu.cn/ubuntu-cdimage/ubuntu-base/releases/22.04/release/ubuntu-base-22.04.3-base-arm64.tar.gz",
+            // Mirror 3: USTC
+            "https://mirrors.ustc.edu.cn/ubuntu-cdimage/ubuntu-base/releases/22.04/release/ubuntu-base-22.04.3-base-arm64.tar.gz",
+            // Mirror 4: Aliyun
+            "https://mirrors.aliyun.com/ubuntu-cdimage/ubuntu-base/releases/22.04/release/ubuntu-base-22.04.3-base-arm64.tar.gz",
+        ),
     )
 
     private var eventSink: EventChannel.EventSink? = null
@@ -105,62 +153,111 @@ class MainActivity : FlutterActivity() {
             }
     }
     
-    // --- FIX: APK EXTRACTION FALLBACK & BETTER ERROR MESSAGE ---
+    // ─── TEST IF A BINARY IS ACTUALLY EXECUTABLE ──────────────────────────────
+    // canExecute() is UNRELIABLE on Android 10+ (FUSE filesystem returns wrong result).
+    // Instead, actually try to execute the binary and check exit code.
+    private fun isActuallyExecutable(file: File): Boolean {
+        if (!file.exists()) return false
+        return try {
+            val proc = ProcessBuilder(file.absolutePath, "--version")
+                .redirectErrorStream(true)
+                .start()
+            // proot --version exits 0 or 1 — both mean it ran. 
+            // Only error=13 (EACCES) or error=8 (ENOEXEC) means NOT executable.
+            val exited = proc.waitFor(3, TimeUnit.SECONDS)
+            if (!exited) { proc.destroyForcibly(); true } // still running = executable
+            val code = proc.exitValue()
+            code != 126 && code != 127 // 126=not executable, 127=not found
+        } catch (e: Exception) {
+            val msg = e.message ?: ""
+            // error=13 Permission denied, error=8 Exec format error = NOT executable
+            !msg.contains("error=13") && !msg.contains("error=8") && 
+            !msg.contains("Permission denied") && !msg.contains("ENOEXEC")
+        }
+    }
+
+    // ─── ENSURE PROOT BINARY ──────────────────────────────────────────────────
+    // Tries multiple exec-safe locations in priority order.
     private fun ensureProotBinary(): String? {
-        // Check 1: If prootBin (either extracted or bundled) is ready, we're good.
-        if (prootBin.exists() && prootBin.canExecute()) {
-            return null // Success
+        // ── Priority 1: nativeLibraryDir (set by Android, always exec-safe) ──
+        if (prootBundledBin.exists() && isActuallyExecutable(prootBundledBin)) {
+            return null
         }
 
-        // Check 2: Try to extract from APK as a fallback.
-        // This is crucial for AGP 8+ where useLegacyPackaging=false is default.
-        try {
+        // ── Priority 2: codeCacheDir/bin/proot (already extracted & works) ──
+        if (prootExtractedBin.exists() && isActuallyExecutable(prootExtractedBin)) {
+            return null
+        }
+
+        // ── Priority 3: Extract from APK → codeCacheDir (exec-safe on Android) ──
+        // codeCacheDir = /data/user/0/com.pyom/code_cache/
+        // Android marks this exec-safe for JIT compilation. Never has noexec.
+        val extractError = tryExtractProot(prootExtractedBin)
+        if (extractError == null && isActuallyExecutable(prootExtractedBin)) {
+            prootVersionFile.writeText("extracted-to-codecache")
+            return null
+        }
+
+        // ── Priority 4: Try other candidate exec-safe paths ──
+        val candidates = listOf(
+            File(filesDir.parent ?: filesDir.absolutePath, "code_cache/bin/proot"),
+            File(applicationInfo.dataDir, "code_cache/bin/proot"),
+        )
+        for (candidate in candidates) {
+            val err = tryExtractProot(candidate)
+            if (err == null && isActuallyExecutable(candidate)) {
+                // Update prootBin to use this working path dynamically
+                prootVersionFile.writeText("alt-path:${candidate.absolutePath}")
+                return null
+            }
+        }
+
+        // All failed — build detailed diagnostic
+        val nativeFiles = File(applicationInfo.nativeLibraryDir).listFiles()
+            ?.take(8)?.joinToString(", ") { it.name } ?: "none"
+
+        return "FATAL: Cannot execute proot binary on this device.\n\n" +
+               "Tried locations:\n" +
+               "  1. nativeLibraryDir: ${prootBundledBin.absolutePath}\n" +
+               "     → exists=${prootBundledBin.exists()}\n" +
+               "  2. codeCacheDir: ${prootExtractedBin.absolutePath}\n" +
+               "     → exists=${prootExtractedBin.exists()}, error=${extractError ?: "exec failed"}\n\n" +
+               "nativeLibDir contents: [$nativeFiles]\n\n" +
+               "SOLUTION: Add the proot ARM64 binary as:\n" +
+               "android/app/src/main/jniLibs/arm64-v8a/libproot.so\n" +
+               "Download from: https://github.com/termux/proot/releases"
+    }
+
+    private fun tryExtractProot(dest: File): String? {
+        return try {
             val apkPath = applicationInfo.sourceDir
             ZipFile(apkPath).use { zip ->
                 val entry = zip.getEntry("lib/arm64-v8a/libproot.so")
-                    ?: return "FATAL: lib/arm64-v8a/libproot.so not found inside APK ($apkPath)."
-
-                binDir.mkdirs()
+                    ?: return "libproot.so not found in APK"
+                dest.parentFile?.mkdirs()
                 zip.getInputStream(entry).use { input ->
-                    prootExtractedBin.outputStream().use { output ->
-                        input.copyTo(output)
-                    }
+                    dest.outputStream().use { output -> input.copyTo(output) }
                 }
-                prootExtractedBin.setExecutable(true, false)
-
-                // If extraction was successful, return null (success)
-                if (prootExtractedBin.exists() && prootExtractedBin.canExecute()) {
-                    prootVersionFile.writeText("bundled-extracted")
-                    return null // Success
-                }
+                dest.setExecutable(true, false)
+                try {
+                    Runtime.getRuntime()
+                        .exec(arrayOf("chmod", "755", dest.absolutePath))
+                        .waitFor(2, TimeUnit.SECONDS)
+                } catch (_: Exception) {}
             }
+            null // success
         } catch (e: Exception) {
-            // If extraction fails, we'll report it in the final error message.
+            e.message
         }
-        
-        // Check 3: If we're still here, both checks failed. Generate a detailed error report.
-        val nativeLibDir = File(applicationInfo.nativeLibraryDir)
-        val nativeLibFiles = nativeLibDir.listFiles()?.joinToString(", ") { it.name } ?: "is empty or does not exist"
-
-        return """
-        FATAL: proot binary not found or not executable.
-        - Bundled Path: ${prootBundledBin.absolutePath} (exists: ${prootBundledBin.exists()})
-        - Extracted Path: ${prootExtractedBin.absolutePath} (exists: ${prootExtractedBin.exists()})
-        - APK Path: ${applicationInfo.sourceDir}
-        - Native Lib Dir: ${nativeLibDir.absolutePath}
-        - Native Lib Contents: [$nativeLibFiles]
-        
-        This usually happens with newer Android Gradle Plugin versions.
-        Please ensure 'android.packaging.jniLibs.useLegacyPackaging = true' is in your app/build.gradle file.
-        """.trimIndent()
     }
 
     private fun isEnvironmentInstalled(envId: String): Boolean {
         val envDir = File(envRoot, envId)
         if (!envDir.exists()) return false
-        val hasShell = listOf(File(envDir, "bin/sh"), File(envDir, "bin/bash")).any { it.exists() }
-        val hasOsRelease = File(envDir, "etc/os-release").exists()
-        return hasShell || hasOsRelease
+        // Check etc/os-release (most reliable indicator)
+        if (File(envDir, "etc/os-release").exists()) return true
+        // Check shell via robust finder
+        return findShellInEnv(envDir) != null
     }
 
     private fun getInstalledEnvironment(): Map<String, Any>? {
@@ -212,16 +309,22 @@ class MainActivity : FlutterActivity() {
             sendProgress("✅ proot ready", 0.05)
             if (isSetupCancelled.get()) { mainHandler.post { result.error("CANCELLED", "Cancelled", null) }; return }
 
+            sendProgress("🌐 Checking network…", 0.08)
+            checkNetworkOrThrow()
+
             sendProgress("Downloading $distro rootfs…", 0.10)
             val tarFile = File(extDir, "rootfs_${envId}.tar.gz")
             val sources = rootfsSources[distro] ?: rootfsSources["alpine"]!!
-            downloadWithProgress(sources[0], tarFile, 0.10, 0.60)
+            downloadWithFallback(sources, tarFile, 0.10, 0.60)
             if (isSetupCancelled.get()) { tarFile.delete(); mainHandler.post { result.error("CANCELLED", "Cancelled", null) }; return }
 
             sendProgress("Extracting rootfs…", 0.62)
             extractTarGz(tarFile, envDir)
             tarFile.delete()
             if (isSetupCancelled.get()) { mainHandler.post { result.error("CANCELLED", "Cancelled", null) }; return }
+
+            sendProgress("🔧 Repairing rootfs symlinks…", 0.73)
+            repairRootfsShell(envDir)
 
             sendProgress("Configuring environment…", 0.75)
             File(envDir, "etc/resolv.conf").writeText("nameserver 8.8.8.8\nnameserver 1.1.1.1\n")
@@ -270,6 +373,131 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    // ─── ROOTFS SHELL REPAIR ──────────────────────────────────────────────────
+    // Alpine 3.19+ uses merged-usr: /bin is a SYMLINK to usr/bin.
+    // Our tar extractor creates the symlink but Java's File.exists() may not
+    // follow it properly. This function scans for busybox/sh and creates
+    // concrete shell files so proot can always find them.
+    private fun repairRootfsShell(envDir: File) {
+        // Step 1: Fix /bin if it's a dangling or missing symlink
+        val binDir = File(envDir, "bin")
+        val usrBinDir = File(envDir, "usr/bin")
+
+        // If /bin doesn't exist or is a broken symlink, create it as real dir
+        // or copy from usr/bin
+        if (!binDir.exists() && !java.nio.file.Files.isSymbolicLink(binDir.toPath())) {
+            if (usrBinDir.exists()) {
+                // Create /bin as real directory with essential symlinks
+                binDir.mkdirs()
+            }
+        }
+
+        // Step 2: Find busybox anywhere in the rootfs
+        val busyboxLocations = listOf(
+            File(envDir, "bin/busybox"),
+            File(envDir, "usr/bin/busybox"),
+            File(envDir, "sbin/busybox"),
+            File(envDir, "usr/sbin/busybox"),
+        )
+        val busybox = busyboxLocations.firstOrNull { 
+            it.exists() || java.nio.file.Files.isSymbolicLink(it.toPath()) 
+        }
+
+        // Step 3: Find sh/bash in usr/bin (merged-usr systems)
+        val shellInUsrBin = listOf(
+            File(envDir, "usr/bin/sh"),
+            File(envDir, "usr/bin/bash"),
+            File(envDir, "usr/local/bin/sh"),
+        ).firstOrNull { it.exists() }
+
+        // Step 4: Ensure /bin/sh exists as a real executable file
+        val binSh = File(envDir, "bin/sh")
+        if (!binSh.exists()) {
+            when {
+                shellInUsrBin != null -> {
+                    // Copy the actual shell binary to /bin/sh
+                    binDir.mkdirs()
+                    try {
+                        shellInUsrBin.copyTo(binSh, overwrite = true)
+                        binSh.setExecutable(true, false)
+                    } catch (_: Exception) {}
+                }
+                busybox != null -> {
+                    // Copy busybox to /bin/sh
+                    binDir.mkdirs()
+                    try {
+                        // First copy busybox to bin/ if not already there
+                        val binBusybox = File(envDir, "bin/busybox")
+                        if (!binBusybox.exists()) {
+                            busybox.copyTo(binBusybox, overwrite = true)
+                            binBusybox.setExecutable(true, false)
+                        }
+                        binSh.copyTo(binBusybox, overwrite = false)
+                        binBusybox.copyTo(binSh, overwrite = true)
+                        binSh.setExecutable(true, false)
+                    } catch (_: Exception) {}
+                }
+                else -> {
+                    // Last resort: write a minimal shell wrapper script
+                    // This at least lets proot start; real sh will be found inside
+                    binDir.mkdirs()
+                    // Search recursively for any shell binary
+                    val foundShell = envDir.walk()
+                        .filter { it.isFile && (it.name == "sh" || it.name == "bash" || it.name == "busybox") }
+                        .firstOrNull()
+                    if (foundShell != null) {
+                        try {
+                            foundShell.copyTo(binSh, overwrite = true)
+                            binSh.setExecutable(true, false)
+                        } catch (_: Exception) {}
+                    }
+                }
+            }
+        }
+
+        // Step 5: Ensure /bin/sh is executable
+        if (binSh.exists()) binSh.setExecutable(true, false)
+        
+        // Step 6: Create /usr/bin/env if missing (needed by python3 shebang)
+        val usrBinEnv = File(envDir, "usr/bin/env")
+        if (!usrBinEnv.exists() && binSh.exists()) {
+            usrBinDir.mkdirs()
+            // env script fallback
+            try {
+                usrBinEnv.writeText("#!/bin/sh\nexec \"\$@\"\n")
+                usrBinEnv.setExecutable(true, false)
+            } catch (_: Exception) {}
+        }
+
+        // Step 7: Ensure tmp dir has right permissions
+        File(envDir, "tmp").apply { mkdirs(); setWritable(true, false) }
+    }
+
+    // ─── FIND SHELL IN ENV ────────────────────────────────────────────────────
+    // Robust shell finder — checks real files, symlinks, and merged-usr layouts
+    private fun findShellInEnv(envDir: File): String? {
+        val candidates = listOf(
+            "/bin/bash", "/bin/sh",
+            "/usr/bin/bash", "/usr/bin/sh",
+            "/usr/local/bin/bash", "/usr/local/bin/sh",
+            "/bin/busybox", "/usr/bin/busybox",
+        )
+        for (shellPath in candidates) {
+            val f = File(envDir, shellPath.drop(1))
+            // Check real file exists OR is a symlink (might be merged-usr)
+            if (f.exists() || java.nio.file.Files.isSymbolicLink(f.toPath())) {
+                return shellPath
+            }
+        }
+        // Fallback: scan entire rootfs for any sh/bash binary
+        return try {
+            val found = envDir.walk()
+                .filter { it.isFile && (it.name == "sh" || it.name == "bash") }
+                .firstOrNull()
+            found?.absolutePath?.removePrefix(envDir.absolutePath)
+        } catch (_: Exception) { null }
+    }
+
     private fun runCommandInProot(envId: String, command: String, workingDir: String, timeoutMs: Int): Map<String, Any> {
         val prootError = ensureProotBinary()
         if (prootError != null) {
@@ -281,23 +509,26 @@ class MainActivity : FlutterActivity() {
             return mapOf("stdout" to "", "exitCode" to -1, "stderr" to "Environment directory not found: ${envDir.absolutePath}")
         }
         
-        val shell = listOf(
-            "/bin/bash", "/bin/sh",
-            "/usr/bin/bash", "/usr/bin/sh",
-            "/usr/local/bin/bash", "/usr/local/bin/sh"
-        ).firstOrNull { File(envDir, it.drop(1)).let { f -> f.exists() || java.nio.file.Files.isSymbolicLink(f.toPath()) } }
-            ?: return mapOf("stdout" to "", "exitCode" to -1, "stderr" to "No valid shell found in rootfs. Try reinstalling the environment.")
+        val shell = findShellInEnv(envDir)
+            ?: return mapOf("stdout" to "", "exitCode" to -1, "stderr" to 
+                "No valid shell found in rootfs.\nDebug info:\n" +
+                "- bin/sh exists: ${File(envDir, "bin/sh").exists()}\n" +
+                "- bin/sh symlink: ${java.nio.file.Files.isSymbolicLink(File(envDir, "bin/sh").toPath())}\n" +
+                "- usr/bin/sh exists: ${File(envDir, "usr/bin/sh").exists()}\n" +
+                "- bin/ contents: ${File(envDir, "bin").listFiles()?.take(10)?.map { it.name } ?: "not found"}\n" +
+                "Please delete the environment in Settings and reinstall."
+            )
 
         val cmd = listOf(
             prootBin.absolutePath,
             "--kill-on-exit", "-k", "5.4.0", "--link2symlink", "-r", envDir.absolutePath,
             "-w", workingDir, "-b", "/dev", "-b", "/proc", "-b", "/sys",
-            "-b", "${filesDir.absolutePath}:/data_internal", "-0",
+            "-b", "${extDir.absolutePath}:/data_internal", "-0",
             shell, "-c", command
         )
 
         val pb = ProcessBuilder(cmd).apply {
-            directory(filesDir)
+            directory(extDir)   // working dir must also be on exec-safe storage
             redirectErrorStream(false)
             environment().apply {
                 put("HOME", "/root")
@@ -336,22 +567,139 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    private fun downloadWithProgress(urlStr: String, dest: File, progressStart: Double, progressEnd: Double) {
-        val conn = URL(urlStr).openConnection() as HttpURLConnection
-        conn.connect()
-        val total = conn.contentLengthLong.toDouble()
-        var downloaded = 0L
-        conn.inputStream.use { input ->
-            FileOutputStream(dest).use { output ->
-                val buf = ByteArray(8192)
-                var n: Int
-                while (input.read(buf).also { n = it } != -1) {
-                    if (isSetupCancelled.get()) throw Exception("Download cancelled")
-                    output.write(buf, 0, n)
-                    downloaded += n
-                    val p = progressStart + (downloaded / total) * (progressEnd - progressStart)
-                    sendProgress("Downloading… ${(downloaded / 1048576.0).toInt()}MB / ${(total / 1048576.0).toInt()}MB", p)
+    // ─── BIND THREAD TO ACTIVE NETWORK ────────────────────────────────────────
+    // This is the ROOT CAUSE FIX: executor threads sometimes lose their
+    // network binding on Android, causing DNS to fail even when internet works.
+    private fun bindToActiveNetwork() {
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            val network = cm.activeNetwork
+            if (network != null) {
+                cm.bindProcessToNetwork(network)
+            }
+        } catch (e: Exception) {
+            // Best-effort — ignore if fails
+        }
+    }
+
+    // ─── NETWORK CHECK ─────────────────────────────────────────────────────────
+    private fun checkNetworkOrThrow() {
+        bindToActiveNetwork() // Always bind first!
+
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val network = cm.activeNetwork
+        val capabilities = if (network != null) cm.getNetworkCapabilities(network) else null
+
+        val hasInternet = capabilities != null && (
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) ||
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) ||
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+        )
+
+        if (!hasInternet) {
+            throw Exception(
+                "❌ No active internet connection detected.\n\n" +
+                "Please check:\n" +
+                "  • WiFi or mobile data is ON\n" +
+                "  • Airplane mode is OFF\n" +
+                "  • App has network permission in Settings\n"
+            )
+        }
+    }
+
+    // ─── MULTI-MIRROR DOWNLOAD ─────────────────────────────────────────────────
+    private fun downloadWithFallback(
+        mirrors: List<String>,
+        dest: File,
+        progressStart: Double,
+        progressEnd: Double,
+    ) {
+        bindToActiveNetwork()
+        var lastException: Exception? = null
+
+        mirrors.forEachIndexed { index, urlStr ->
+            if (isSetupCancelled.get()) throw Exception("Download cancelled")
+            try {
+                sendProgress("📥 Trying mirror ${index + 1}/${mirrors.size}…", progressStart + 0.01)
+                downloadWithProgress(urlStr, dest, progressStart, progressEnd)
+                return // Success
+            } catch (e: Exception) {
+                lastException = e
+                if (e.message?.contains("cancelled") == true) throw e
+                val reason = when {
+                    e.message?.contains("resolve host") == true ||
+                    e.message?.contains("UnknownHost") == true -> "DNS failed"
+                    e.message?.contains("timeout") == true ||
+                    e.message?.contains("timed out") == true -> "Timeout"
+                    e.message?.contains("HTTP 403") == true ||
+                    e.message?.contains("HTTP 404") == true -> "Not found"
+                    e.message?.contains("SSL") == true -> "SSL error"
+                    else -> "Failed: ${e.message?.take(40)}"
                 }
+                sendProgress("⚠️ Mirror ${index + 1} failed ($reason)…", progressStart + 0.02)
+                dest.takeIf { it.exists() }?.delete()
+                // Re-bind before next attempt
+                bindToActiveNetwork()
+            }
+        }
+
+        throw Exception(
+            "❌ All ${mirrors.size} mirrors failed.\nLast error: ${lastException?.message}\n\n" +
+            "Please check your internet connection and try again."
+        )
+    }
+
+    // ─── OKHTTP DOWNLOAD ───────────────────────────────────────────────────────
+    private fun downloadWithProgress(
+        urlStr: String,
+        dest: File,
+        progressStart: Double,
+        progressEnd: Double,
+    ) {
+        bindToActiveNetwork() // Bind before every individual attempt
+
+        val request = Request.Builder()
+            .url(urlStr)
+            .header("User-Agent", "Pyom-IDE/1.0 Android")
+            .build()
+
+        okHttpClient.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) {
+                throw Exception("HTTP ${response.code} from server")
+            }
+
+            val body = response.body ?: throw Exception("Empty response body")
+            val total = body.contentLength() // -1 if unknown
+
+            var downloaded = 0L
+            var lastUpdateMs = System.currentTimeMillis()
+
+            body.byteStream().use { input ->
+                FileOutputStream(dest).use { output ->
+                    val buf = ByteArray(65536) // 64KB buffer
+                    var n: Int
+                    while (input.read(buf).also { n = it } != -1) {
+                        if (isSetupCancelled.get()) throw Exception("Download cancelled")
+                        output.write(buf, 0, n)
+                        downloaded += n
+
+                        val now = System.currentTimeMillis()
+                        if (now - lastUpdateMs > 900) {
+                            lastUpdateMs = now
+                            val ratio = if (total > 0) downloaded.toDouble() / total else 0.4
+                            val p = progressStart + ratio * (progressEnd - progressStart)
+                            val dlMB = (downloaded / 1_048_576.0).toInt()
+                            val totalStr = if (total > 0) "/ ${(total / 1_048_576.0).toInt()}MB" else ""
+                            sendProgress("📥 ${dlMB}MB $totalStr", p.coerceIn(progressStart, progressEnd))
+                        }
+                    }
+                }
+            }
+
+            if (dest.length() < 512) {
+                dest.delete()
+                throw Exception("Downloaded file too small (${dest.length()} bytes) — server may have returned an error page")
             }
         }
     }
