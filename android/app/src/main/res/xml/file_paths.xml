@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- App internal storage (where linux env, projects live) -->
+    <files-path name="internal_files" path="." />
+    <!-- External storage (Downloads etc.) -->
+    <external-path name="external_files" path="." />
+    <!-- App-specific external storage -->
+    <external-files-path name="app_external_files" path="." />
+    <!-- Cache -->
+    <cache-path name="cache" path="." />
+</paths>

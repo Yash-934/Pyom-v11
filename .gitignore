@@ -1,0 +1,44 @@
+# Miscellaneous
+.dart_tool/
+.flutter-plugins-dependencies
+.gradle
+.idea
+.packages
+.pub-cache/
+.pub/
+build/
+ios/Flutter/App.framework
+ios/Flutter/Flutter.podspec
+ios/Pods/
+ios/Runner.xcworkspace/
+ios/ServiceDefinitions.json
+pubspec.lock
+*.iml
+*.ipr
+*.iws
+*.vscode/
+
+# Android
+android/.gradle/
+android/app/src/main/jniLibs/
+android/gradle/wrapper/gradle-wrapper.jar
+android/gradlew
+android/gradlew.bat
+android/local.properties
+/android/app/google-services.json
+
+# iOS
+/ios/Runner/GoogleService-Info.plist
+
+# Web
+/web/index.html
+/web/flutter_bootstrap.js
+/web/main.dart.js
+/web/assets/
+
+# Nix
+.idx/dev.nix
+
+# Logs
+firebase-debug.log
+proot.deb
